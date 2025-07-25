@@ -1,6 +1,7 @@
+--prefer-binary
+aiohttp==3.8.6
 aiogram==3.0.0b7
 psycopg2-binary==2.9.9
 flask==2.3.2
 requests==2.31.0
 python-dotenv==1.0.1
-aiohttp==3.8.6
