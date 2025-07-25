@@ -1,21 +1,29 @@
 import os
 import logging
+import json
+from datetime import datetime, timedelta
+from typing import Optional
+import asyncio
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    LabeledPrice, PreCheckoutQuery, FSInputFile
+    LabeledPrice, PreCheckoutQuery
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from typing import Optional
-import sqlite3
-from datetime import datetime, timedelta
-import asyncio
+import psycopg2
+from psycopg2 import sql
+
+from flask import Flask
+from threading import Thread
+import requests
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,68 +32,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация бота
+# Конфигурация с вашими данными
 BOT_TOKEN = "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI"
-ADMIN_IDS = [7353415682]  # ID администраторов
-SUPPORT_ID = "@APECTOBAH_REYTZOM"  # Ник поддержки
-CHANNEL_ID = -1002850774775  # ID канала
+ADMIN_IDS = [7353415682]
+SUPPORT_ID = "@ReSigncf"
+CHANNEL_ID = -1002850774775
+DATABASE_URL = "postgresql://signdb_user:fqxpUJ3VUykQtz8CZD4Ghoijpsu0uoWn@dpg-d21vmg3e5dus73955mj0-a/signdb"
+RENDER_APP_NAME = "Mycode-1"
 
-# Настройка базы данных
-DB_NAME = "bot_database.db"
-
-def init_db():
-    """Инициализация базы данных"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        is_admin BOOLEAN DEFAULT FALSE,
-        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS payments (
-        payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount INTEGER,
-        currency TEXT,
-        status TEXT,
-        payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS takes (
-        take_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        content_type TEXT,
-        content TEXT,
-        media_path TEXT,
-        status TEXT DEFAULT 'pending',
-        admin_id INTEGER,
-        rating_change INTEGER DEFAULT 0,
-        submission_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id),
-        FOREIGN KEY (admin_id) REFERENCES users (user_id)
-    )''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS user_stats (
-        user_id INTEGER PRIMARY KEY,
-        takes_count INTEGER DEFAULT 0,
-        rating INTEGER DEFAULT 0,
-        premium_until TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )''')
-    
-    conn.commit()
-    conn.close()
-
-init_db()
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
 # Состояния FSM
 class TakeStates(StatesGroup):
@@ -95,19 +52,187 @@ class TakeStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_for_broadcast = State()
+    waiting_for_premium_days = State()
+    waiting_for_premium_username = State()
 
-# Инициализация бота
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# ===================== БАЗА ДАННЫХ =====================
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
+def init_db():
+    """Инициализация таблиц в базе данных"""
+    commands = (
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            is_admin BOOLEAN DEFAULT FALSE,
+            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS payments (
+            payment_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            amount INTEGER,
+            currency TEXT,
+            status TEXT,
+            payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS takes (
+            take_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            content_type TEXT,
+            content TEXT,
+            file_id TEXT,
+            status TEXT DEFAULT 'pending',
+            admin_id BIGINT,
+            rating_change INTEGER DEFAULT 0,
+            submission_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id),
+            FOREIGN KEY (admin_id) REFERENCES users (user_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id BIGINT PRIMARY KEY,
+            takes_count INTEGER DEFAULT 0,
+            rating INTEGER DEFAULT 0,
+            premium_until TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+        """
+    )
+    
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for command in commands:
+            cursor.execute(command)
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error initializing database: {e}")
+
+# ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
+def add_user(user_id: int, username: Optional[str], full_name: str, is_admin: bool = False):
+    """Добавление нового пользователя"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO users (user_id, username, full_name, is_admin) VALUES (%s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id, username, full_name, is_admin)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error adding user: {e}")
+
+def get_user_stats(user_id: int) -> Optional[dict]:
+    """Получение статистики пользователя"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT u.user_id, u.username, u.full_name, 
+               COALESCE(us.takes_count, 0) as takes_count, 
+               COALESCE(us.rating, 0) as rating,
+               us.premium_until
+        FROM users u
+        LEFT JOIN user_stats us ON u.user_id = us.user_id
+        WHERE u.user_id = %s
+        ''', (user_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if result:
+            return {
+                "user_id": result[0],
+                "username": result[1],
+                "full_name": result[2],
+                "takes_count": result[3],
+                "rating": result[4],
+                "premium_until": result[5]
+            }
+    except Exception as e:
+        logger.error(f"Error getting user stats: {e}")
+    return None
+
+def get_user_by_username(username: str) -> Optional[dict]:
+    """Поиск пользователя по username"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT user_id, username, full_name 
+        FROM users 
+        WHERE username = %s
+        ''', (username.lower().replace("@", ""),))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if result:
+            return {
+                "user_id": result[0],
+                "username": result[1],
+                "full_name": result[2]
+            }
+    except Exception as e:
+        logger.error(f"Error getting user by username: {e}")
+    return None
+
+async def add_premium(user_id: int, days: int):
+    """Добавление премиум-статуса пользователю"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT premium_until FROM user_stats WHERE user_id = %s", (user_id,))
+        current_premium = cursor.fetchone()
+        
+        if current_premium and current_premium[0]:
+            new_date = current_premium[0] + timedelta(days=days)
+        else:
+            new_date = datetime.now() + timedelta(days=days)
+        
+        cursor.execute('''
+        INSERT INTO user_stats (user_id, premium_until) 
+        VALUES (%s, %s)
+        ON CONFLICT (user_id) DO UPDATE 
+        SET premium_until = %s
+        ''', (user_id, new_date, new_date))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        try:
+            await bot.send_message(
+                user_id,
+                f"🎉 Вам активирован премиум на {days} дней!\n"
+                f"Доступно до: {new_date.strftime('%d.%m.%Y %H:%M')}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка уведомления о премиуме: {e}")
+            return False
+    except Exception as e:
+        logger.error(f"Error adding premium: {e}")
+        return False
 
 # ===================== КЛАВИАТУРЫ =====================
 def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    """Главное меню"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    is_admin = cursor.fetchone()
-    conn.close()
+    """Главное меню с учетом прав администратора"""
+    is_admin = user_id in ADMIN_IDS
     
     builder = ReplyKeyboardBuilder()
     buttons = [
@@ -118,7 +243,7 @@ def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
         KeyboardButton(text="📚 Инструкция")
     ]
     
-    if is_admin and is_admin[0]:
+    if is_admin:
         buttons.append(KeyboardButton(text="👑 Админ панель"))
     
     builder.add(*buttons)
@@ -130,6 +255,7 @@ def get_admin_menu() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.add(
         KeyboardButton(text="📢 Рассылка"),
+        KeyboardButton(text="🎁 Выдать премиум"),
         KeyboardButton(text="📊 Статистика"),
         KeyboardButton(text="⬅️ Назад")
     )
@@ -137,7 +263,7 @@ def get_admin_menu() -> ReplyKeyboardMarkup:
     return builder.as_markup(resize_keyboard=True)
 
 def get_take_action_keyboard(take_id: int) -> InlineKeyboardMarkup:
-    """Кнопки модерации"""
+    """Кнопки действий с тейком для администратора"""
     builder = InlineKeyboardBuilder()
     builder.add(
         InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{take_id}"),
@@ -147,137 +273,17 @@ def get_take_action_keyboard(take_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 def get_payment_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура оплаты"""
+    """Клавиатура для оплаты"""
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 Оплатить 15 Stars", pay=True)
     builder.button(text="❌ Отмена", callback_data="cancel_payment")
     builder.adjust(1)
     return builder.as_markup()
 
-# ===================== БАЗА ДАННЫХ =====================
-def add_user(user_id: int, username: Optional[str], full_name: str, is_admin: bool = False):
-    """Добавление пользователя"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, full_name, is_admin) VALUES (?, ?, ?, ?)",
-        (user_id, username, full_name, is_admin)
-    )
-    conn.commit()
-    conn.close()
-
-def get_user_stats(user_id: int) -> Optional[dict]:
-    """Получение статистики"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-    SELECT u.user_id, u.username, u.full_name, 
-           COALESCE(us.takes_count, 0) as takes_count, 
-           COALESCE(us.rating, 0) as rating,
-           us.premium_until
-    FROM users u
-    LEFT JOIN user_stats us ON u.user_id = us.user_id
-    WHERE u.user_id = ?
-    ''', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        return {
-            "user_id": result[0],
-            "username": result[1],
-            "full_name": result[2],
-            "takes_count": result[3],
-            "rating": result[4],
-            "premium_until": result[5]
-        }
-    return None
-
-def add_take(user_id: int, content_type: str, content: Optional[str], media_path: Optional[str] = None) -> int:
-    """Добавление тейка"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO takes (user_id, content_type, content, media_path) VALUES (?, ?, ?, ?)",
-        (user_id, content_type, content, media_path)
-    )
-    take_id = cursor.lastrowid
-    
-    cursor.execute('''
-    INSERT OR IGNORE INTO user_stats (user_id, takes_count, rating) 
-    VALUES (?, 0, 0)
-    ''', (user_id,))
-    
-    cursor.execute('''
-    UPDATE user_stats 
-    SET takes_count = takes_count + 1 
-    WHERE user_id = ?
-    ''', (user_id,))
-    
-    conn.commit()
-    conn.close()
-    return take_id
-
-def update_take_status(take_id: int, status: str, admin_id: int, rating_change: int = 0):
-    """Обновление статуса тейка"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    UPDATE takes 
-    SET status = ?, admin_id = ?, rating_change = ?
-    WHERE take_id = ?
-    ''', (status, admin_id, rating_change, take_id))
-    
-    if status == 'accepted' and rating_change > 0:
-        cursor.execute('''
-        UPDATE user_stats 
-        SET rating = rating + ?
-        WHERE user_id = (SELECT user_id FROM takes WHERE take_id = ?)
-        ''', (rating_change, take_id))
-    
-    conn.commit()
-    conn.close()
-
-async def add_premium(user_id: int, days: int):
-    """Добавление премиума"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT premium_until FROM user_stats WHERE user_id = ?", (user_id,))
-    current_premium = cursor.fetchone()
-    
-    new_date = (datetime.strptime(current_premium[0], "%Y-%m-%d %H:%M:%S") + timedelta(days=days) 
-               if current_premium and current_premium[0] 
-               else datetime.now() + timedelta(days=days))
-    
-    cursor.execute('''
-    INSERT OR IGNORE INTO user_stats (user_id, premium_until) 
-    VALUES (?, ?)
-    ''', (user_id, new_date.strftime("%Y-%m-%d %H:%M:%S")))
-    
-    cursor.execute('''
-    UPDATE user_stats 
-    SET premium_until = ?
-    WHERE user_id = ?
-    ''', (new_date.strftime("%Y-%m-%d %H:%M:%S"), user_id))
-    
-    conn.commit()
-    conn.close()
-    
-    try:
-        await bot.send_message(
-            user_id,
-            f"🎉 Вам активирован премиум на {days} дней!\n"
-            f"Доступно до: {new_date.strftime('%d.%m.%Y %H:%M')}"
-        )
-    except Exception as e:
-        logger.error(f"Ошибка уведомления о премиуме: {e}")
-
-# ===================== ОБРАБОТЧИКИ =====================
+# ===================== ОБРАБОТЧИКИ КОМАНД =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Обработчик старта"""
+    """Обработчик команды /start"""
     user_id = message.from_user.id
     username = message.from_user.username
     full_name = message.from_user.full_name
@@ -298,6 +304,7 @@ async def cmd_id(message: Message):
 
 @dp.message(F.text == "⬅️ Назад")
 async def back_to_main(message: Message):
+    """Возврат в главное меню"""
     await message.answer(
         "Главное меню:",
         reply_markup=get_main_menu(message.from_user.id)
@@ -305,6 +312,7 @@ async def back_to_main(message: Message):
 
 @dp.message(F.text == "👑 Админ панель")
 async def admin_panel(message: Message):
+    """Отображение админ-панели"""
     if message.from_user.id in ADMIN_IDS:
         await message.answer(
             "Админ панель:",
@@ -315,6 +323,7 @@ async def admin_panel(message: Message):
 
 @dp.message(F.text == "📢 Рассылка")
 async def broadcast_menu(message: Message, state: FSMContext):
+    """Начало рассылки сообщений"""
     if message.from_user.id in ADMIN_IDS:
         await message.answer(
             "Введите сообщение для рассылки:",
@@ -324,14 +333,22 @@ async def broadcast_menu(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_broadcast)
 async def process_broadcast(message: Message, state: FSMContext):
+    """Обработка рассылки"""
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        users = cursor.fetchall()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error getting users for broadcast: {e}")
+        await message.answer("❌ Ошибка при получении списка пользователей")
+        await state.clear()
+        return
 
     success = failed = 0
     for user in users:
@@ -352,12 +369,73 @@ async def process_broadcast(message: Message, state: FSMContext):
     )
     await state.clear()
 
+@dp.message(F.text == "🎁 Выдать премиум")
+async def give_premium_start(message: Message, state: FSMContext):
+    """Начало процесса выдачи премиума"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    await message.answer(
+        "Введите количество дней премиума:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminStates.waiting_for_premium_days)
+
+@dp.message(AdminStates.waiting_for_premium_days)
+async def process_premium_days(message: Message, state: FSMContext):
+    """Обработка количества дней премиума"""
+    if not message.text.isdigit():
+        await message.answer("❌ Введите число дней!")
+        return
+    
+    days = int(message.text)
+    if days <= 0:
+        await message.answer("❌ Число дней должно быть положительным!")
+        return
+    
+    await state.update_data(days=days)
+    await message.answer(
+        "Теперь введите username пользователя (без @):",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(AdminStates.waiting_for_premium_username)
+
+@dp.message(AdminStates.waiting_for_premium_username)
+async def process_premium_username(message: Message, state: FSMContext):
+    """Обработка username и выдача премиума"""
+    data = await state.get_data()
+    days = data['days']
+    username = message.text.strip().replace("@", "")
+    
+    user = get_user_by_username(username)
+    if not user:
+        await message.answer(
+            f"❌ Пользователь @{username} не найден!",
+            reply_markup=get_admin_menu()
+        )
+        await state.clear()
+        return
+    
+    success = await add_premium(user['user_id'], days)
+    if success:
+        await message.answer(
+            f"✅ Пользователю @{username} успешно выдан премиум на {days} дней!",
+            reply_markup=get_admin_menu()
+        )
+    else:
+        await message.answer(
+            f"❌ Не удалось выдать премиум пользователю @{username}",
+            reply_markup=get_admin_menu()
+        )
+    
+    await state.clear()
+
 @dp.message(F.text == "📤 Отправить тейк")
 async def send_take(message: Message, state: FSMContext):
     """Обработчик отправки тейка"""
     user_stats = get_user_stats(message.from_user.id)
     
-    if user_stats and user_stats.get('premium_until') and datetime.now() < datetime.strptime(user_stats['premium_until'], "%Y-%m-%d %H:%M:%S"):
+    if user_stats and user_stats.get('premium_until') and datetime.now() < user_stats['premium_until']:
         await message.answer(
             "Отправьте ваш тейк (текст/фото/видео):",
             reply_markup=ReplyKeyboardRemove()
@@ -367,7 +445,7 @@ async def send_take(message: Message, state: FSMContext):
         await message.answer_invoice(
             title="Оплата тейка",
             description="Публикация стоит 15 Stars",
-            provider_token="",
+            provider_token="",  # Укажите ваш платежный токен
             currency="XTR",
             prices=[LabeledPrice(label="15 Stars", amount=15)],
             payload="take_payment",
@@ -377,6 +455,7 @@ async def send_take(message: Message, state: FSMContext):
 
 @dp.pre_checkout_query()
 async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
+    """Проверка платежа"""
     if pre_checkout_query.invoice_payload != "take_payment":
         await bot.answer_pre_checkout_query(
             pre_checkout_query.id,
@@ -397,17 +476,22 @@ async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def process_payment(message: Message, state: FSMContext):
+    """Обработка успешного платежа"""
     payment = message.successful_payment
     user_id = message.from_user.id
     
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO payments (user_id, amount, currency, status) VALUES (?, ?, ?, ?)",
-        (user_id, payment.total_amount, payment.currency, "completed")
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO payments (user_id, amount, currency, status) VALUES (%s, %s, %s, %s)",
+            (user_id, payment.total_amount, payment.currency, "completed")
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving payment: {e}")
     
     await add_premium(user_id, 1)
     
@@ -419,6 +503,7 @@ async def process_payment(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "cancel_payment")
 async def cancel_payment(callback: CallbackQuery, state: FSMContext):
+    """Отмена платежа"""
     await callback.message.edit_text("Оплата отменена.")
     await state.clear()
     await callback.message.answer(
@@ -432,20 +517,21 @@ async def process_take_content(message: Message, state: FSMContext):
     user_id = message.from_user.id
     content_type = "text" if message.text else "photo" if message.photo else "video"
     content = message.text or message.caption
-    media_path = None
+    file_id = None
     
-    if message.photo or message.video:
-        if not os.path.exists("media"):
-            os.makedirs("media")
-        
-        file = message.photo[-1] if message.photo else message.video
-        ext = "jpg" if message.photo else "mp4"
-        media_path = f"media/{user_id}_{file.file_unique_id}.{ext}"
-        await file.download(destination_file=media_path)
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        file_id = message.video.file_id
     
-    take_id = add_take(user_id, content_type, content, media_path)
+    take_id = add_take(user_id, content_type, content, file_id)
     
-    # Отправка админам на модерацию (с сохранением информации об авторе для модерации)
+    if take_id == -1:
+        await message.answer("❌ Ошибка при отправке тейка. Попробуйте позже.")
+        await state.clear()
+        return
+    
+    # Отправка админам на модерацию
     for admin_id in ADMIN_IDS:
         try:
             if content_type == "text":
@@ -455,18 +541,17 @@ async def process_take_content(message: Message, state: FSMContext):
                     reply_markup=get_take_action_keyboard(take_id)
                 )
             else:
-                media = FSInputFile(media_path)
                 if content_type == "photo":
                     await bot.send_photo(
                         admin_id,
-                        photo=media,
+                        photo=file_id,
                         caption=f"📸 Новый тейк (ID: {take_id}):\n\n{content}" if content else None,
                         reply_markup=get_take_action_keyboard(take_id)
                     )
                 else:
                     await bot.send_video(
                         admin_id,
-                        video=media,
+                        video=file_id,
                         caption=f"🎥 Новый тейк (ID: {take_id}):\n\n{content}" if content else None,
                         reply_markup=get_take_action_keyboard(take_id)
                     )
@@ -481,230 +566,36 @@ async def process_take_content(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("accept_"))
 async def accept_take(callback: CallbackQuery):
-    """Одобрение тейка без имени автора"""
+    """Одобрение тейка"""
     take_id = int(callback.data.split("_")[1])
     admin_id = callback.from_user.id
     
     update_take_status(take_id, "accepted", admin_id, 5)
     
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-    SELECT t.user_id, t.content_type, t.content, t.media_path
-    FROM takes t
-    WHERE t.take_id = ?
-    ''', (take_id,))
-    take = cursor.fetchone()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+        SELECT t.user_id, t.content_type, t.content, t.file_id
+        FROM takes t
+        WHERE t.take_id = %s
+        ''', (take_id,))
+        take = cursor.fetchone()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching take: {e}")
+        await callback.message.edit_text("❌ Ошибка при публикации")
+        return
     
     if take:
-        user_id, content_type, content, media_path = take
+        user_id, content_type, content, file_id = take
         
         try:
             if content_type == "text":
                 await bot.send_message(
                     CHANNEL_ID,
-                    f"{content}"  # Только контент
+                    f"{content}"
                 )
             else:
-                media = FSInputFile(media_path)
-                if content_type == "photo":
-                    await bot.send_photo(
-                        CHANNEL_ID,
-                        photo=media,
-                        caption=content if content else None  # Без упоминания автора
-                    )
-                else:
-                    await bot.send_video(
-                        CHANNEL_ID,
-                        video=media,
-                        caption=content if content else None  # Без упоминания автора
-                    )
-            
-            # Уведомление автору
-            await bot.send_message(
-                user_id,
-                "🎉 Ваш тейк одобрен! +5 к рейтингу!"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка публикации тейка: {e}")
-    
-    await callback.message.edit_text("✅ Тейк опубликован")
-
-@dp.callback_query(F.data.startswith("reject_"))
-async def reject_take(callback: CallbackQuery):
-    take_id = int(callback.data.split("_")[1])
-    admin_id = callback.from_user.id
-    
-    update_take_status(take_id, "rejected", admin_id)
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM takes WHERE take_id = ?", (take_id,))
-    user_id = cursor.fetchone()[0]
-    conn.close()
-    
-    try:
-        await bot.send_message(
-            user_id,
-            "❌ Ваш тейк был отклонен модератором."
-        )
-    except Exception as e:
-        logger.error(f"Ошибка уведомления пользователя: {e}")
-    
-    await callback.message.edit_text("❌ Тейк отклонен")
-
-@dp.callback_query(F.data.startswith("edit_"))
-async def edit_take(callback: CallbackQuery, state: FSMContext):
-    take_id = int(callback.data.split("_")[1])
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT content FROM takes WHERE take_id = ?", (take_id,))
-    take_content = cursor.fetchone()[0]
-    conn.close()
-    
-    await callback.message.answer(
-        f"Текущий текст тейка:\n\n{take_content}\n\nОтправьте новый текст:",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await state.set_state(TakeStates.waiting_for_edit)
-    await state.update_data(take_id=take_id)
-
-@dp.message(TakeStates.waiting_for_edit)
-async def process_edited_take(message: Message, state: FSMContext):
-    data = await state.get_data()
-    take_id = data['take_id']
-    admin_id = message.from_user.id
-    
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE takes SET content = ?, status = 'accepted', admin_id = ?, rating_change = 5 WHERE take_id = ?",
-        (message.text, admin_id, take_id)
-    )
-    
-    cursor.execute('''
-    UPDATE user_stats 
-    SET rating = rating + 5
-    WHERE user_id = (SELECT user_id FROM takes WHERE take_id = ?)
-    ''', (take_id,))
-    
-    cursor.execute('''
-    SELECT t.user_id, t.content_type, t.media_path
-    FROM takes t
-    WHERE t.take_id = ?
-    ''', (take_id,))
-    take_info = cursor.fetchone()
-    conn.close()
-    
-    if take_info:
-        user_id, content_type, media_path = take_info
-        
-        try:
-            if content_type == "text":
-                await bot.send_message(
-                    CHANNEL_ID,
-                    f"{message.text}"
-                )
-            else:
-                media = FSInputFile(media_path)
-                if content_type == "photo":
-                    await bot.send_photo(
-                        CHANNEL_ID,
-                        photo=media,
-                        caption=message.text if message.text else None
-                    )
-                else:
-                    await bot.send_video(
-                        CHANNEL_ID,
-                        video=media,
-                        caption=message.text if message.text else None
-                    )
-            
-            await bot.send_message(
-                user_id,
-                f"🎉 Ваш тейк был отредактирован и опубликован! +5 к рейтингу!\n\n"
-                f"Опубликованная версия:\n\n{message.text}"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка публикации: {e}")
-    
-    await message.answer(
-        "✅ Тейк отредактирован и опубликован.",
-        reply_markup=get_admin_menu() if admin_id in ADMIN_IDS else get_main_menu(admin_id)
-    )
-    await state.clear()
-
-@dp.message(F.text == "👤 Профиль")
-async def show_profile(message: Message):
-    user_stats = get_user_stats(message.from_user.id)
-    
-    if user_stats:
-        premium_status = "✅ Активен" if user_stats.get('premium_until') and datetime.now() < datetime.strptime(user_stats['premium_until'], "%Y-%m-%d %H:%M:%S") else "❌ Не активен"
-        
-        await message.answer(
-            f"👤 <b>Ваш профиль</b>\n\n"
-            f"🆔 ID: <code>{user_stats['user_id']}</code>\n"
-            f"📊 Статистика:\n"
-            f"📤 Отправлено тейков: {user_stats['takes_count']}\n"
-            f"⭐ Рейтинг: {user_stats['rating']}\n"
-            f"💎 Премиум: {premium_status}\n"
-            f"📅 Премиум до: {user_stats['premium_until'] or 'Нет'}"
-        )
-
-@dp.message(F.text == "🆘 Поддержка")
-async def support(message: Message):
-    await message.answer(
-        "Если у вас есть вопросы или проблемы, напишите нашему менеджеру:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Написать в поддержку", url=f"https://t.me/{SUPPORT_ID}")]
-        ])
-    )
-
-@dp.message(F.text == "🏆 Рейтинг")
-async def show_rating(message: Message):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-    SELECT u.username, us.rating, us.takes_count
-    FROM users u
-    JOIN user_stats us ON u.user_id = us.user_id
-    ORDER BY us.rating DESC
-    LIMIT 10
-    ''')
-    top_users = cursor.fetchall()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    conn.close()
-    
-    rating_text = "🏆 <b>Топ пользователей</b> 🏆\n\n"
-    for i, (username, rating, takes_count) in enumerate(top_users, 1):
-        rating_text += f"{i}. {'@' + username if username else 'Аноним'} - ⭐{rating} ({takes_count} тейков)\n"
-    
-    rating_text += f"\nВсего пользователей: {total_users}"
-    await message.answer(rating_text)
-
-@dp.message(F.text == "📚 Инструкция")
-async def show_instructions(message: Message):
-    await message.answer(
-        "📚 <b>Инструкция по использованию бота</b>\n\n"
-        "1. <b>Отправить тейк</b> - после оплаты 15 Stars можно отправить текст/фото/видео\n"
-        "2. <b>Профиль</b> - ваша статистика и рейтинг\n"
-        "3. <b>Поддержка</b> - связь с администрацией\n\n"
-        "⭐ <b>Как повысить рейтинг?</b>\n"
-        "- Каждый одобренный тейк дает +5 к рейтингу\n"
-        "- Чем больше тейков, тем выше в рейтинге\n\n"
-        "💎 <b>Премиум статус</b>\n"
-        "- Позволяет отправлять тейки бесплатно"
-    )
-
-async def main():
-    """Запуск бота"""
-    if not os.path.exists("media"):
-        os.makedirs("media")
-    
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+       
