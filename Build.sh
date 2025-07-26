@@ -1,8 +1,6 @@
 #!/bin/bash
-# Установка зависимостей
-python -m pip install --upgrade pip
-pip install wheel setuptools
-pip install --no-cache-dir --prefer-binary -r requirements.txt
-
-# Запуск бота
+# Установка без сборки из исходников
+pip install --upgrade pip
+pip install aiohttp==3.8.6 --no-binary :none: --only-binary :all:
+pip install -r requirements.txt
 python bot.py
