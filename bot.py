@@ -64,7 +64,7 @@ def init_db():
         user_id INTEGER,
         content_type TEXT,
         content TEXT,
-        media_id TEXT,  # Изменил media_path на media_id
+        media_id TEXT, 
         status TEXT DEFAULT 'pending',
         admin_id INTEGER,
         rating_change INTEGER DEFAULT 0,
@@ -805,3 +805,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
