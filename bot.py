@@ -2,9 +2,8 @@ import os
 import logging
 import sqlite3
 import gdown
-import schedule
-import time
-import threading
+import signal
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
@@ -20,190 +19,131 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-import asyncio
+from aiogram.exceptions import TelegramConflictError
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# Загрузка переменных окружения
+# ===================== НАСТРОЙКА =====================
 load_dotenv()
 
-# Конфигурация бота
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI")
-ADMIN_IDS = [7353415682]  # ID администраторов
-SUPPORT_ID = "@Oxoxece"  # Ник поддержки
-CHANNEL_ID = -1002850774775  # ID канала
-
-# Настройка базы данных
+# Конфигурация
+BOT_TOKEN = os.getenv("7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI")
+ADMIN_IDS = [7353415682]
+SUPPORT_ID = "@Oxoxece"
+CHANNEL_ID = -1002850774775
 DB_NAME = "bot_database.db"
-GDRIVE_DB_ID = "xBpGyOFk_3qomQiwLlK9YlaAWpI"  # ID файла на Google Drive
+GDRIVE_DB_ID = "xBpGyOFk_3qomQiwLlK9YlaAWpI"
 GDRIVE_URL = f"https://drive.google.com/uc?id={GDRIVE_DB_ID}"
 
-# ===================== СИСТЕМА GOOGLE DRIVE =====================
-def download_db_from_gdrive():
-    """Скачивает базу данных с Google Drive"""
-    try:
-        if not os.path.exists(DB_NAME):
-            gdown.download(GDRIVE_URL, DB_NAME, quiet=True)
-            logger.info("✅ База данных загружена с Google Drive")
-    except Exception as e:
-        logger.error(f"Ошибка загрузки базы: {e}")
-
-def upload_db_to_gdrive():
-    """Загружает базу данных на Google Drive"""
-    try:
-        if os.path.exists(DB_NAME):
-            os.system(f"gdown --update {GDRIVE_URL} -O {DB_NAME}")
-            logger.info("🔄 База данных сохранена в Google Drive")
-    except Exception as e:
-        logger.error(f"Ошибка сохранения базы: {e}")
-
-def run_backup_scheduler():
-    """Запускает периодическое сохранение"""
-    schedule.every(5).minutes.do(upload_db_to_gdrive)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-# Запускаем автосохранение в отдельном потоке
-backup_thread = threading.Thread(target=run_backup_scheduler, daemon=True)
-backup_thread.start()
-
-# ===================== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====================
-def init_db():
-    """Инициализация базы данных"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        is_admin BOOLEAN DEFAULT FALSE,
-        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS payments (
-        payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount INTEGER,
-        currency TEXT,
-        status TEXT,
-        payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS takes (
-        take_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        content_type TEXT,
-        content TEXT,
-        media_id TEXT,
-        status TEXT DEFAULT 'pending',
-        admin_id INTEGER,
-        rating_change INTEGER DEFAULT 0,
-        submission_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id),
-        FOREIGN KEY (admin_id) REFERENCES users (user_id)
-    )''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS user_stats (
-        user_id INTEGER PRIMARY KEY,
-        takes_count INTEGER DEFAULT 0,
-        rating INTEGER DEFAULT 0,
-        premium_until TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("✅ База данных инициализирована")
-
-# Загружаем базу при старте
-download_db_from_gdrive()
-init_db()
-
-# ===================== СОСТОЯНИЯ FSM =====================
-class TakeStates(StatesGroup):
-    waiting_for_payment = State()
-    waiting_for_content = State()
-    waiting_for_edit = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_broadcast = State()
-    waiting_for_premium_user = State()
-    waiting_for_premium_days = State()
+# Логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ===================== КЛАВИАТУРЫ =====================
-def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    """Главное меню"""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    is_admin = cursor.fetchone()
-    conn.close()
-    
-    builder = ReplyKeyboardBuilder()
-    buttons = [
-        KeyboardButton(text="📤 Отправить тейк"),
-        KeyboardButton(text="👤 Профиль"),
-        KeyboardButton(text="🆘 Поддержка"),
-        KeyboardButton(text="🏆 Рейтинг"),
-        KeyboardButton(text="📚 Инструкция")
-    ]
-    
-    if is_admin and is_admin[0]:
-        buttons.append(KeyboardButton(text="👑 Админ панель"))
-    
-    builder.add(*buttons)
-    builder.adjust(2, 2, 1, 1)
-    return builder.as_markup(resize_keyboard=True)
+# ===================== СИСТЕМА СОХРАНЕНИЯ =====================
+def download_db():
+    """Скачать базу с Google Drive"""
+    try:
+        if not os.path.exists(DB_NAME):
+            gdown.download(GDRIVE_URL, DB_NAME, quiet=True)
+            logger.info("✅ База загружена с Google Drive")
+            return True
+    except Exception as e:
+        logger.error(f"Ошибка загрузки: {e}")
+    return False
 
-def get_admin_menu() -> ReplyKeyboardMarkup:
-    """Меню администратора"""
-    builder = ReplyKeyboardBuilder()
-    builder.add(
-        KeyboardButton(text="📢 Рассылка"),
-        KeyboardButton(text="📊 Статистика"),
-        KeyboardButton(text="🎁 Выдать премиум"),
-        KeyboardButton(text="⬅️ Назад")
-    )
-    builder.adjust(2)
-    return builder.as_markup(resize_keyboard=True)
+def upload_db():
+    """Загрузить базу на Google Drive"""
+    try:
+        if os.path.exists(DB_NAME):
+            os.system(f"gdown --update {GDRIVE_URL} -O {DB_NAME}")
+            logger.info("🔄 База сохранена в Google Drive")
+            return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения: {e}")
+    return False
 
-def get_take_action_keyboard(take_id: int) -> InlineKeyboardMarkup:
-    """Кнопки модерации"""
-    builder = InlineKeyboardBuilder()
-    builder.add(
-        InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{take_id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{take_id}"),
-        InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{take_id}")
-    )
-    return builder.as_markup()
+async def auto_save():
+    """Асинхронное автосохранение каждые 5 минут"""
+    while True:
+        await asyncio.sleep(300)  # 5 минут
+        upload_db()
 
-def get_payment_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура оплаты"""
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Оплатить 15 Stars", pay=True)
-    builder.button(text="❌ Отмена", callback_data="cancel_payment")
-    builder.adjust(1)
-    return builder.as_markup()
+# ===================== ОБРАБОТКА СИГНАЛОВ =====================
+async def graceful_shutdown():
+    """Корректное завершение работы"""
+    logger.info("🛑 Получен сигнал остановки")
+    upload_db()
+    await bot.session.close()
+    await dp.storage.close()
+    exit(0)
+
+def handle_signals():
+    """Регистрация обработчиков сигналов"""
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda s, f: asyncio.create_task(graceful_shutdown()))
 
 # ===================== БАЗА ДАННЫХ =====================
+def init_db():
+    """Инициализация структуры базы"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    tables = [
+        '''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            is_admin BOOLEAN DEFAULT FALSE,
+            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''',
+        '''CREATE TABLE IF NOT EXISTS payments (
+            payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount INTEGER,
+            currency TEXT,
+            status TEXT,
+            payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )''',
+        '''CREATE TABLE IF NOT EXISTS takes (
+            take_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            content_type TEXT,
+            content TEXT,
+            media_id TEXT,
+            status TEXT DEFAULT 'pending',
+            admin_id INTEGER,
+            rating_change INTEGER DEFAULT 0,
+            submission_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id),
+            FOREIGN KEY (admin_id) REFERENCES users (user_id)
+        )''',
+        '''CREATE TABLE IF NOT EXISTS user_stats (
+            user_id INTEGER PRIMARY KEY,
+            takes_count INTEGER DEFAULT 0,
+            rating INTEGER DEFAULT 0,
+            premium_until TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )'''
+    ]
+    
+    for table in tables:
+        cursor.execute(table)
+    
+    conn.commit()
+    conn.close()
+    logger.info("✅ База данных инициализирована")
+
 def add_user(user_id: int, username: Optional[str], full_name: str, is_admin: bool = False):
-    """Добавление пользователя"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
@@ -214,7 +154,6 @@ def add_user(user_id: int, username: Optional[str], full_name: str, is_admin: bo
     conn.close()
 
 def get_user_stats(user_id: int) -> Optional[dict]:
-    """Получение статистики"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -241,7 +180,6 @@ def get_user_stats(user_id: int) -> Optional[dict]:
     return None
 
 def add_take(user_id: int, content_type: str, content: Optional[str], media_id: Optional[str] = None) -> int:
-    """Добавление тейка"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
@@ -266,7 +204,6 @@ def add_take(user_id: int, content_type: str, content: Optional[str], media_id: 
     return take_id
 
 def update_take_status(take_id: int, status: str, admin_id: int, rating_change: int = 0):
-    """Обновление статуса тейка"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
@@ -287,18 +224,15 @@ def update_take_status(take_id: int, status: str, admin_id: int, rating_change: 
     conn.close()
 
 async def add_premium(user_id: int, days: int):
-    """Добавление премиума"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
     cursor.execute("SELECT premium_until FROM user_stats WHERE user_id = ?", (user_id,))
     current_premium = cursor.fetchone()
     
-    new_date = (
-        datetime.strptime(current_premium[0], "%Y-%m-%d %H:%M:%S") + timedelta(days=days) 
-        if current_premium and current_premium[0] 
-        else datetime.now() + timedelta(days=days)
-    )
+    new_date = (datetime.strptime(current_premium[0], "%Y-%m-%d %H:%M:%S") + timedelta(days=days) 
+               if current_premium and current_premium[0] 
+               else datetime.now() + timedelta(days=days))
     
     cursor.execute('''
     INSERT OR IGNORE INTO user_stats (user_id, premium_until) 
@@ -323,10 +257,71 @@ async def add_premium(user_id: int, days: int):
     except Exception as e:
         logger.error(f"Ошибка уведомления о премиуме: {e}")
 
+# ===================== КЛАВИАТУРЫ =====================
+def get_main_menu(user_id: int) -> ReplyKeyboardMarkup:
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
+    is_admin = cursor.fetchone()
+    conn.close()
+    
+    builder = ReplyKeyboardBuilder()
+    buttons = [
+        KeyboardButton(text="📤 Отправить тейк"),
+        KeyboardButton(text="👤 Профиль"),
+        KeyboardButton(text="🆘 Поддержка"),
+        KeyboardButton(text="🏆 Рейтинг"),
+        KeyboardButton(text="📚 Инструкция")
+    ]
+    
+    if is_admin and is_admin[0]:
+        buttons.append(KeyboardButton(text="👑 Админ панель"))
+    
+    builder.add(*buttons)
+    builder.adjust(2, 2, 1, 1)
+    return builder.as_markup(resize_keyboard=True)
+
+def get_admin_menu() -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.add(
+        KeyboardButton(text="📢 Рассылка"),
+        KeyboardButton(text="📊 Статистика"),
+        KeyboardButton(text="🎁 Выдать премиум"),
+        KeyboardButton(text="⬅️ Назад")
+    )
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
+
+def get_take_action_keyboard(take_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{take_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{take_id}"),
+        InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{take_id}")
+    )
+    return builder.as_markup()
+
+def get_payment_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💳 Оплатить 15 Stars", pay=True)
+    builder.button(text="❌ Отмена", callback_data="cancel_payment")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# ===================== СОСТОЯНИЯ FSM =====================
+class TakeStates(StatesGroup):
+    waiting_for_payment = State()
+    waiting_for_content = State()
+    waiting_for_edit = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_premium_user = State()
+    waiting_for_premium_days = State()
+
 # ===================== ОБРАБОТЧИКИ =====================
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    """Обработчик старта"""
     user_id = message.from_user.id
     username = message.from_user.username
     full_name = message.from_user.full_name
@@ -342,7 +337,6 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
-    """Показывает ID пользователя"""
     await message.answer(f"Ваш ID: `{message.from_user.id}`", parse_mode="Markdown")
 
 @dp.message(F.text == "⬅️ Назад")
@@ -370,6 +364,36 @@ async def broadcast_menu(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove()
         )
         await state.set_state(AdminStates.waiting_for_broadcast)
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    conn.close()
+
+    success = failed = 0
+    for user in users:
+        try:
+            await bot.copy_message(
+                chat_id=user[0],
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+            success += 1
+        except Exception as e:
+            logger.error(f"Ошибка рассылки для {user[0]}: {e}")
+            failed += 1
+
+    await message.answer(
+        f"📊 Результат рассылки:\nУспешно: {success}\nНе удалось: {failed}",
+        reply_markup=get_admin_menu()
+    )
+    await state.clear()
 
 @dp.message(F.text == "🎁 Выдать премиум")
 async def give_premium_menu(message: Message, state: FSMContext):
@@ -412,36 +436,6 @@ async def process_premium_days(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("Некорректное количество дней. Введите целое положительное число:")
 
-@dp.message(AdminStates.waiting_for_broadcast)
-async def process_broadcast(message: Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    conn.close()
-
-    success = failed = 0
-    for user in users:
-        try:
-            await bot.copy_message(
-                chat_id=user[0],
-                from_chat_id=message.chat.id,
-                message_id=message.message_id
-            )
-            success += 1
-        except Exception as e:
-            logger.error(f"Ошибка рассылки для {user[0]}: {e}")
-            failed += 1
-
-    await message.answer(
-        f"📊 Результат рассылки:\nУспешно: {success}\nНе удалось: {failed}",
-        reply_markup=get_admin_menu()
-    )
-    await state.clear()
-
 @dp.message(F.text == "📊 Статистика")
 async def show_stats(message: Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -451,7 +445,6 @@ async def show_stats(message: Message):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Общая статистика
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
     
@@ -467,7 +460,6 @@ async def show_stats(message: Message):
     cursor.execute("SELECT COUNT(*) FROM user_stats WHERE premium_until > datetime('now')")
     premium_users = cursor.fetchone()[0]
     
-    # Топ пользователей по рейтингу
     cursor.execute('''
     SELECT u.user_id, u.username, u.full_name, us.rating 
     FROM users u
@@ -497,7 +489,6 @@ async def show_stats(message: Message):
 
 @dp.message(F.text == "📤 Отправить тейк")
 async def send_take(message: Message, state: FSMContext):
-    """Обработчик отправки тейка"""
     user_stats = get_user_stats(message.from_user.id)
     
     if user_stats and user_stats.get('premium_until') and datetime.now() < datetime.strptime(user_stats['premium_until'], "%Y-%m-%d %H:%M:%S"):
@@ -571,7 +562,6 @@ async def cancel_payment(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(TakeStates.waiting_for_content, F.text | F.photo | F.video)
 async def process_take_content(message: Message, state: FSMContext):
-    """Обработка контента тейка"""
     user_id = message.from_user.id
     content_type = "text" if message.text else "photo" if message.photo else "video"
     content = message.text or message.caption
@@ -584,7 +574,6 @@ async def process_take_content(message: Message, state: FSMContext):
     
     take_id = add_take(user_id, content_type, content, media_id)
     
-    # Отправка админам на модерацию
     for admin_id in ADMIN_IDS:
         try:
             if content_type == "text":
@@ -618,7 +607,6 @@ async def process_take_content(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("accept_"))
 async def accept_take(callback: CallbackQuery):
-    """Одобрение тейка без имени автора"""
     take_id = int(callback.data.split("_")[1])
     admin_id = callback.from_user.id
     
@@ -641,22 +629,21 @@ async def accept_take(callback: CallbackQuery):
             if content_type == "text":
                 await bot.send_message(
                     CHANNEL_ID,
-                    f"{content}"  # Только контент
+                    f"{content}"
                 )
             elif content_type == "photo":
                 await bot.send_photo(
                     CHANNEL_ID,
                     photo=media_id,
-                    caption=content if content else None  # Без упоминания автора
+                    caption=content if content else None
                 )
             elif content_type == "video":
                 await bot.send_video(
                     CHANNEL_ID,
                     video=media_id,
-                    caption=content if content else None  # Без упоминания автора
+                    caption=content if content else None
                 )
             
-            # Уведомление автору
             await bot.send_message(
                 user_id,
                 "🎉 Ваш тейк одобрен! +5 к рейтингу!"
@@ -846,14 +833,26 @@ async def show_instructions(message: Message):
     )
     await message.answer(instructions)
 
-async def on_shutdown(dp):
-    """Сохранение базы при выключении"""
-    upload_db_to_gdrive()
-    logger.info("Бот выключается, база данных сохранена")
-
+# ===================== ЗАПУСК =====================
 async def main():
-    await dp.start_polling(bot, on_shutdown=on_shutdown)
+    # Инициализация
+    handle_signals()
+    download_db()
+    init_db()
+    
+    # Запуск автосохранения
+    asyncio.create_task(auto_save())
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    except TelegramConflictError:
+        logger.error("Обнаружен конфликт: уже запущен другой экземпляр бота")
+        await graceful_shutdown()
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {e}")
+    finally:
+        await graceful_shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
