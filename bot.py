@@ -25,7 +25,7 @@ from aiogram.exceptions import TelegramConflictError
 load_dotenv()
 
 # Конфигурация
-BOT_TOKEN = os.getenv("BOT_TOKEN" , "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI")
+BOT_TOKEN = os.getenv("7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI")
 ADMIN_IDS = [7353415682]
 SUPPORT_ID = "@Oxoxece"
 CHANNEL_ID = -1002850774775
@@ -856,4 +856,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
