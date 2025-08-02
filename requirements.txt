@@ -2,4 +2,3 @@ aiogram
 gdown==4.6.6
 python-dotenv==1.0.0
 schedule==1.1.0
-sqlite3
