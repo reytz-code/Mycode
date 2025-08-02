@@ -294,9 +294,11 @@ async def add_premium(user_id: int, days: int):
     cursor.execute("SELECT premium_until FROM user_stats WHERE user_id = ?", (user_id,))
     current_premium = cursor.fetchone()
     
-    new_date = (datetime.strptime(current_premium[0], "%Y-%m-%d %H:%M:%S") + timedelta(days=days) 
-               if current_premium and current_premium[0] 
-               else datetime.now() + timedelta(days=days)
+    new_date = (
+        datetime.strptime(current_premium[0], "%Y-%m-%d %H:%M:%S") + timedelta(days=days) 
+        if current_premium and current_premium[0] 
+        else datetime.now() + timedelta(days=days)
+    )
     
     cursor.execute('''
     INSERT OR IGNORE INTO user_stats (user_id, premium_until) 
@@ -854,3 +856,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
