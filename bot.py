@@ -1,5 +1,13 @@
 import os
 import logging
+import sqlite3
+import gdown
+import schedule
+import time
+import threading
+from datetime import datetime, timedelta
+from typing import Optional
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -12,9 +20,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from typing import Optional
-import sqlite3
-from datetime import datetime, timedelta
 import asyncio
 
 # Настройка логирования
@@ -24,15 +29,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Загрузка переменных окружения
+load_dotenv()
+
 # Конфигурация бота
-BOT_TOKEN = "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI")
 ADMIN_IDS = [7353415682]  # ID администраторов
-SUPPORT_ID = "@Oxoxece"  # Новый ник поддержки
+SUPPORT_ID = "@Oxoxece"  # Ник поддержки
 CHANNEL_ID = -1002850774775  # ID канала
 
 # Настройка базы данных
 DB_NAME = "bot_database.db"
+GDRIVE_DB_ID = "xBpGyOFk_3qomQiwLlK9YlaAWpI"  # ID файла на Google Drive
+GDRIVE_URL = f"https://drive.google.com/uc?id={GDRIVE_DB_ID}"
 
+# ===================== СИСТЕМА GOOGLE DRIVE =====================
+def download_db_from_gdrive():
+    """Скачивает базу данных с Google Drive"""
+    try:
+        if not os.path.exists(DB_NAME):
+            gdown.download(GDRIVE_URL, DB_NAME, quiet=True)
+            logger.info("✅ База данных загружена с Google Drive")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки базы: {e}")
+
+def upload_db_to_gdrive():
+    """Загружает базу данных на Google Drive"""
+    try:
+        if os.path.exists(DB_NAME):
+            os.system(f"gdown --update {GDRIVE_URL} -O {DB_NAME}")
+            logger.info("🔄 База данных сохранена в Google Drive")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения базы: {e}")
+
+def run_backup_scheduler():
+    """Запускает периодическое сохранение"""
+    schedule.every(5).minutes.do(upload_db_to_gdrive)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+# Запускаем автосохранение в отдельном потоке
+backup_thread = threading.Thread(target=run_backup_scheduler, daemon=True)
+backup_thread.start()
+
+# ===================== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ =====================
 def init_db():
     """Инициализация базы данных"""
     conn = sqlite3.connect(DB_NAME)
@@ -64,7 +105,7 @@ def init_db():
         user_id INTEGER,
         content_type TEXT,
         content TEXT,
-        media_id TEXT, 
+        media_id TEXT,
         status TEXT DEFAULT 'pending',
         admin_id INTEGER,
         rating_change INTEGER DEFAULT 0,
@@ -84,10 +125,13 @@ def init_db():
     
     conn.commit()
     conn.close()
+    logger.info("✅ База данных инициализирована")
 
+# Загружаем базу при старте
+download_db_from_gdrive()
 init_db()
 
-# Состояния FSM
+# ===================== СОСТОЯНИЯ FSM =====================
 class TakeStates(StatesGroup):
     waiting_for_payment = State()
     waiting_for_content = State()
@@ -252,7 +296,7 @@ async def add_premium(user_id: int, days: int):
     
     new_date = (datetime.strptime(current_premium[0], "%Y-%m-%d %H:%M:%S") + timedelta(days=days) 
                if current_premium and current_premium[0] 
-               else datetime.now() + timedelta(days=days))
+               else datetime.now() + timedelta(days=days)
     
     cursor.execute('''
     INSERT OR IGNORE INTO user_stats (user_id, premium_until) 
@@ -800,9 +844,13 @@ async def show_instructions(message: Message):
     )
     await message.answer(instructions)
 
+async def on_shutdown(dp):
+    """Сохранение базы при выключении"""
+    upload_db_to_gdrive()
+    logger.info("Бот выключается, база данных сохранена")
+
 async def main():
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, on_shutdown=on_shutdown)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
