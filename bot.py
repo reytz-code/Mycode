@@ -6,7 +6,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    LabeledPrice, PreCheckoutQuery, FSInputFile
+    LabeledPrice, PreCheckoutQuery
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.enums import ParseMode
@@ -64,7 +64,7 @@ def init_db():
         user_id INTEGER,
         content_type TEXT,
         content TEXT,
-        media_path TEXT,
+        media_id TEXT,  # Изменил media_path на media_id
         status TEXT DEFAULT 'pending',
         admin_id INTEGER,
         rating_change INTEGER DEFAULT 0,
@@ -196,13 +196,13 @@ def get_user_stats(user_id: int) -> Optional[dict]:
         }
     return None
 
-def add_take(user_id: int, content_type: str, content: Optional[str], media_path: Optional[str] = None) -> int:
+def add_take(user_id: int, content_type: str, content: Optional[str], media_id: Optional[str] = None) -> int:
     """Добавление тейка"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO takes (user_id, content_type, content, media_path) VALUES (?, ?, ?, ?)",
-        (user_id, content_type, content, media_path)
+        "INSERT INTO takes (user_id, content_type, content, media_id) VALUES (?, ?, ?, ?)",
+        (user_id, content_type, content, media_id)
     )
     take_id = cursor.lastrowid
     
@@ -529,18 +529,14 @@ async def process_take_content(message: Message, state: FSMContext):
     user_id = message.from_user.id
     content_type = "text" if message.text else "photo" if message.photo else "video"
     content = message.text or message.caption
-    media_path = None
+    media_id = None
     
-    if message.photo or message.video:
-        if not os.path.exists("media"):
-            os.makedirs("media")
-        
-        file = message.photo[-1] if message.photo else message.video
-        ext = "jpg" if message.photo else "mp4"
-        media_path = f"media/{user_id}_{file.file_unique_id}.{ext}"
-        await file.download(destination_file=media_path)
+    if message.photo:
+        media_id = message.photo[-1].file_id
+    elif message.video:
+        media_id = message.video.file_id
     
-    take_id = add_take(user_id, content_type, content, media_path)
+    take_id = add_take(user_id, content_type, content, media_id)
     
     # Отправка админам на модерацию
     for admin_id in ADMIN_IDS:
@@ -551,22 +547,20 @@ async def process_take_content(message: Message, state: FSMContext):
                     f"📝 Новый тейк (ID: {take_id}):\n\n{content}",
                     reply_markup=get_take_action_keyboard(take_id)
                 )
-            else:
-                media = FSInputFile(media_path)
-                if content_type == "photo":
-                    await bot.send_photo(
-                        admin_id,
-                        photo=media,
-                        caption=f"📸 Новый тейк (ID: {take_id}):\n\n{content}" if content else None,
-                        reply_markup=get_take_action_keyboard(take_id)
-                    )
-                else:
-                    await bot.send_video(
-                        admin_id,
-                        video=media,
-                        caption=f"🎥 Новый тейк (ID: {take_id}):\n\n{content}" if content else None,
-                        reply_markup=get_take_action_keyboard(take_id)
-                    )
+            elif content_type == "photo":
+                await bot.send_photo(
+                    admin_id,
+                    photo=media_id,
+                    caption=f"📸 Новый тейк (ID: {take_id}):\n\n{content}" if content else None,
+                    reply_markup=get_take_action_keyboard(take_id)
+                )
+            elif content_type == "video":
+                await bot.send_video(
+                    admin_id,
+                    video=media_id,
+                    caption=f"🎥 Новый тейк (ID: {take_id}):\n\n{content}" if content else None,
+                    reply_markup=get_take_action_keyboard(take_id)
+                )
         except Exception as e:
             logger.error(f"Ошибка отправки тейка админу {admin_id}: {e}")
     
@@ -587,7 +581,7 @@ async def accept_take(callback: CallbackQuery):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
-    SELECT t.user_id, t.content_type, t.content, t.media_path
+    SELECT t.user_id, t.content_type, t.content, t.media_id
     FROM takes t
     WHERE t.take_id = ?
     ''', (take_id,))
@@ -595,7 +589,7 @@ async def accept_take(callback: CallbackQuery):
     conn.close()
     
     if take:
-        user_id, content_type, content, media_path = take
+        user_id, content_type, content, media_id = take
         
         try:
             if content_type == "text":
@@ -603,20 +597,18 @@ async def accept_take(callback: CallbackQuery):
                     CHANNEL_ID,
                     f"{content}"  # Только контент
                 )
-            else:
-                media = FSInputFile(media_path)
-                if content_type == "photo":
-                    await bot.send_photo(
-                        CHANNEL_ID,
-                        photo=media,
-                        caption=content if content else None  # Без упоминания автора
-                    )
-                else:
-                    await bot.send_video(
-                        CHANNEL_ID,
-                        video=media,
-                        caption=content if content else None  # Без упоминания автора
-                    )
+            elif content_type == "photo":
+                await bot.send_photo(
+                    CHANNEL_ID,
+                    photo=media_id,
+                    caption=content if content else None  # Без упоминания автора
+                )
+            elif content_type == "video":
+                await bot.send_video(
+                    CHANNEL_ID,
+                    video=media_id,
+                    caption=content if content else None  # Без упоминания автора
+                )
             
             # Уведомление автору
             await bot.send_message(
@@ -688,7 +680,7 @@ async def process_edited_take(message: Message, state: FSMContext):
     ''', (take_id,))
     
     cursor.execute('''
-    SELECT t.user_id, t.content_type, t.media_path
+    SELECT t.user_id, t.content_type, t.media_id
     FROM takes t
     WHERE t.take_id = ?
     ''', (take_id,))
@@ -696,7 +688,7 @@ async def process_edited_take(message: Message, state: FSMContext):
     conn.close()
     
     if take_info:
-        user_id, content_type, media_path = take_info
+        user_id, content_type, media_id = take_info
         
         try:
             if content_type == "text":
@@ -704,20 +696,18 @@ async def process_edited_take(message: Message, state: FSMContext):
                     CHANNEL_ID,
                     message.text
                 )
-            else:
-                media = FSInputFile(media_path)
-                if content_type == "photo":
-                    await bot.send_photo(
-                        CHANNEL_ID,
-                        photo=media,
-                        caption=message.text if message.text else None
-                    )
-                else:
-                    await bot.send_video(
-                        CHANNEL_ID,
-                        video=media,
-                        caption=message.text if message.text else None
-                    )
+            elif content_type == "photo":
+                await bot.send_photo(
+                    CHANNEL_ID,
+                    photo=media_id,
+                    caption=message.text if message.text else None
+                )
+            elif content_type == "video":
+                await bot.send_video(
+                    CHANNEL_ID,
+                    video=media_id,
+                    caption=message.text if message.text else None
+                )
             
             await bot.send_message(
                 user_id,
