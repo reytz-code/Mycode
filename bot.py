@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Токен бота
-BOT_TOKEN = "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI"
+BOT_TOKEN = "7968236729:AAEIaSxTlST7D-BbazdXcyCwSj3lBCnuQ1c"
 
 # ID администраторов
 ADMINS = [7353415682 , 8030716815]  # Замените на реальные ID
@@ -90,4 +90,5 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+
 
