@@ -11,10 +11,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Токен бота
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "7968236729:AAFBi3ma_p43qRQ_O7E9csOoTchJ6K2UlzI"
 
 # ID администраторов
-ADMINS = [123456789]  # Замените на реальные ID
+ADMINS = [7353415682 , 8030716815]  # Замените на реальные ID
 
 # Инициализация бота с правильными параметрами
 bot = Bot(
@@ -90,3 +90,4 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+
